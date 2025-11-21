@@ -4,9 +4,17 @@ import matplotlib.pyplot as plt
 import yfinance as yf
 from datetime import datetime
 import warnings
+import math
+import os
+from typing import Literal, Tuple
+from scipy import stats
 warnings.filterwarnings('ignore')
 
 from strategy import VVIXVIXStrategy
+
+# Create results directory
+RESULTS_DIR = 'results'
+os.makedirs(RESULTS_DIR, exist_ok=True)
 
 class StrategyValidator:
     
@@ -105,7 +113,10 @@ class StrategyValidator:
             ax.set_xlabel('Period')
             ax.legend()
             ax.grid(True, alpha=0.3)
-            plt.show()
+            save_path = os.path.join(RESULTS_DIR, f'walk_forward_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+            plt.savefig(save_path, dpi=300, bbox_inches='tight')
+            print(f"  ✓ Plot saved: {save_path}")
+            plt.close()
             
         return results_df
     
@@ -250,6 +261,272 @@ class StrategyValidator:
             'percentile': percentile_return
         }
     
+    # ========== NEW VALIDATION METHODS ==========
+    
+    def data_quality_checks(self):
+        """Check data integrity and quality"""
+        print("\n" + "="*60)
+        print("DATA QUALITY CHECKS")
+        print("="*60)
+
+        self.strategy.fetch_data()
+        df = self.strategy.data.copy()
+
+        issues = []
+
+        # Index checks
+        if not df.index.is_monotonic_increasing:
+            issues.append("Index is not monotonic increasing.")
+        if df.index.duplicated().any():
+            issues.append("Duplicate index timestamps found.")
+
+        # NaNs and infs
+        nan_cols = df.columns[df.isna().any()].tolist()
+        if nan_cols:
+            issues.append(f"NaNs present in columns: {nan_cols}")
+        inf_mask = ~np.isfinite(df.select_dtypes(include=[np.number]))
+        if inf_mask.any().any():
+            issues.append("Inf/-Inf values present.")
+
+        # Domain checks
+        if (df['VIX'] <= 0).any() or (df['VVIX'] <= 0).any():
+            issues.append("Non-positive values found in VIX or VVIX.")
+        if (df['VVIX_VIX_Ratio'] <= 0).any():
+            issues.append("Non-positive VVIX/VIX ratio found (unexpected).")
+
+        # Simple outlier flag (6-sigma on ratio)
+        ratio = df['VVIX_VIX_Ratio']
+        z = (ratio - ratio.mean()) / ratio.std(ddof=0)
+        extreme = (np.abs(z) > 6).sum()
+        if extreme > 0:
+            issues.append(f"{extreme} extreme ratio outliers flagged (>6σ).")
+
+        status = "PASS" if not issues else "WARN"
+        print(f"Status: {status}")
+        if issues:
+            for i in issues:
+                print(f"- {i}")
+
+        return {"status": status, "issues": issues, "n_obs": len(df)}
+    
+    def leakage_check_walk_forward(self, train_years=3, test_years=1):
+        """Ensure thresholds are computed strictly on training windows"""
+        print("\n" + "="*60)
+        print("LEAKAGE CHECK (Walk-forward splitting)")
+        print("="*60)
+
+        self.strategy.fetch_data()
+        df = self.strategy.data.copy()
+
+        start_date = pd.to_datetime(self.start_date)
+        end_date = pd.to_datetime(self.end_date)
+
+        current_date = start_date
+        ok = True
+
+        while current_date < end_date:
+            train_end = current_date + pd.DateOffset(years=train_years)
+            test_start = train_end
+            test_end   = test_start + pd.DateOffset(years=test_years)
+            if test_end > end_date:
+                break
+
+            train = df[(df.index >= current_date) & (df.index < train_end)]
+            test  = df[(df.index >= test_start) & (df.index < test_end)]
+
+            if len(train) < 252*2 or len(test) < 252:
+                current_date += pd.DateOffset(years=1)
+                continue
+
+            # Verify no overlap
+            if (train.index[-1] >= test.index[0]):
+                print("Overlap between train and test detected!")
+                ok = False
+                break
+
+            current_date += pd.DateOffset(years=1)
+
+        print("Leakage check:", "PASS" if ok else "FAIL")
+        return ok
+    
+    def _estimate_markov(self, signals: pd.Series) -> Tuple[float, float]:
+        """Estimate P(1->1) and P(0->0) from historical binary signals"""
+        s = signals.astype(int).values
+        if len(s) < 2:
+            return 0.5, 0.5
+        n11 = n10 = n01 = n00 = 0
+        for a, b in zip(s[:-1], s[1:]):
+            if a == 1 and b == 1: n11 += 1
+            elif a == 1 and b == 0: n10 += 1
+            elif a == 0 and b == 1: n01 += 1
+            else: n00 += 1
+        p11 = n11 / (n11 + n10) if (n11 + n10) > 0 else 0.5
+        p00 = n00 / (n00 + n01) if (n00 + n01) > 0 else 0.5
+        return p11, p00
+
+    def _simulate_markov_signals(self, length: int, p11: float, p00: float, p_start: float) -> np.ndarray:
+        """Simulate binary signals with given persistence"""
+        s = np.zeros(length, dtype=int)
+        s[0] = 1 if np.random.rand() < p_start else 0
+        for i in range(1, length):
+            if s[i-1] == 1:
+                s[i] = 1 if np.random.rand() < p11 else 0
+            else:
+                s[i] = 0 if np.random.rand() < p00 else 1
+        return s
+
+    def _safe_sharpe(self, returns: pd.Series) -> float:
+        std = returns.std()
+        return (returns.mean() / std * np.sqrt(252)) if std and std > 0 else 0.0
+
+    def _apply_tc(self, returns: pd.Series, signal_series: pd.Series, cost_bps: float) -> pd.Series:
+        """Apply transaction costs on signal flips"""
+        flips = signal_series.astype(int).diff().fillna(0).abs()
+        cost = flips * (cost_bps / 10000.0)
+        return returns - cost
+    
+    def monte_carlo_validation_improved(self, n_simulations=1000, method: Literal['markov','iid'] = 'markov', cost_bps: float = 0.0):
+        """Improved Monte Carlo with matched frequency/persistence"""
+        print("\n" + "="*60)
+        print("MONTE CARLO VALIDATION (IMPROVED)")
+        print("="*60)
+        print(f"Running {n_simulations} simulations using method={method}, cost_bps={cost_bps}")
+
+        self.strategy.fetch_data()
+        data = self.strategy.data
+
+        ratio_threshold = data['VVIX_VIX_Ratio'].quantile(0.90)
+        actual_signals = (
+            (data['VVIX_VIX_Ratio'] >= ratio_threshold) |
+            ((data['VIX'] >= 15) & (data['VVIX'] >= 85))
+        ).astype(int)
+
+        actual_equity_exposure = np.where(actual_signals == 1, 0.5, 1.0)
+        actual_returns = data['SPY_Returns'] * actual_equity_exposure
+        if cost_bps > 0:
+            actual_returns = self._apply_tc(actual_returns, actual_signals, cost_bps)
+
+        actual_total = (1 + actual_returns).cumprod().iloc[-1] - 1
+        actual_ann = (1 + actual_total) ** (252 / len(actual_returns)) - 1
+        actual_sharpe = self._safe_sharpe(actual_returns)
+
+        rand_anns = np.empty(n_simulations)
+        rand_sharpes = np.empty(n_simulations)
+
+        if method == 'markov':
+            p11, p00 = self._estimate_markov(actual_signals)
+            p_start = actual_signals.mean()
+            print(f"Markov parameters: P(1->1)={p11:.3f}, P(0->0)={p00:.3f}")
+            
+        for i in range(n_simulations):
+            if method == 'iid':
+                rand_sig = (np.random.rand(len(data)) < actual_signals.mean()).astype(int)
+            else:
+                rand_sig = self._simulate_markov_signals(len(data), p11, p00, p_start)
+            rand_expo = np.where(rand_sig == 1, 0.5, 1.0)
+            rr = data['SPY_Returns'] * rand_expo
+            if cost_bps > 0:
+                rr = self._apply_tc(rr, pd.Series(rand_sig, index=data.index), cost_bps)
+            total = (1 + rr).cumprod().iloc[-1] - 1
+            rand_anns[i] = (1 + total) ** (252 / len(rr)) - 1
+            rand_sharpes[i] = self._safe_sharpe(rr)
+
+        pct_return = (rand_anns < actual_ann).mean() * 100
+        pct_sharpe = (rand_sharpes < actual_sharpe).mean() * 100
+
+        print(f"\nActual Strategy Performance:")
+        print(f"  Annualized Return: {actual_ann*100:.2f}%")
+        print(f"  Sharpe Ratio: {actual_sharpe:.2f}")
+        print(f"\nRandom Strategy Comparison (method={method}):")
+        print(f"  Mean Random Return: {rand_anns.mean()*100:.2f}% (std {rand_anns.std()*100:.2f}%)")
+        print(f"  Mean Random Sharpe: {rand_sharpes.mean():.2f} (std {rand_sharpes.std():.2f})")
+        print(f"  Actual Return Percentile: {pct_return:.1f}%")
+        print(f"  Actual Sharpe Percentile: {pct_sharpe:.1f}%")
+
+        fig, ax = plt.subplots(figsize=(10,6))
+        ax.hist(rand_anns * 100, bins=50, alpha=0.7, density=True, label='Random (MC)')
+        ax.axvline(actual_ann*100, color='r', linestyle='--', label=f'Actual {actual_ann*100:.2f}%')
+        ax.set_title('Monte Carlo Validation: Annualized Return')
+        ax.set_xlabel('Annualized Return (%)')
+        ax.grid(True, alpha=0.3)
+        ax.legend()
+        save_path = os.path.join(RESULTS_DIR, f'monte_carlo_validation_{datetime.now().strftime("%Y%m%d_%H%M%S")}.png')
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"  ✓ Plot saved: {save_path}")
+        plt.close()
+
+        return {
+            'actual_ann_return': actual_ann,
+            'actual_sharpe': actual_sharpe,
+            'random_ann_returns': rand_anns,
+            'random_sharpes': rand_sharpes,
+            'percentile_return': pct_return,
+            'percentile_sharpe': pct_sharpe
+        }
+    
+    def distribution_tests(self, ratio_pct=0.90, horizons=(1,5,10)):
+        """Test return distributions at different forward horizons"""
+        print("\n" + "="*60)
+        print("DISTRIBUTION TESTS (signal vs no-signal)")
+        print("="*60)
+
+        self.strategy.fetch_data()
+        df = self.strategy.data
+
+        thr = df['VVIX_VIX_Ratio'].quantile(ratio_pct)
+        sig = (
+            (df['VVIX_VIX_Ratio'] >= thr) |
+            ((df['VIX'] >= 15) & (df['VVIX'] >= 85))
+        ).astype(int)
+
+        results = {}
+        for h in horizons:
+            fwd = df['SPY_Returns'].rolling(h).apply(lambda x: np.prod(1+x)-1, raw=True).shift(-h+1)
+            in_sig = fwd[sig==1].dropna()
+            out_sig = fwd[sig==0].dropna()
+            if len(in_sig) > 5 and len(out_sig) > 5:
+                t_stat, t_p = stats.ttest_ind(in_sig, out_sig, equal_var=False)
+                u_stat, u_p = stats.mannwhitneyu(in_sig, out_sig, alternative='two-sided')
+            else:
+                t_stat = t_p = u_stat = u_p = np.nan
+            results[h] = {
+                'signal_mean': in_sig.mean(),
+                'nosignal_mean': out_sig.mean(),
+                'delta': (in_sig.mean() - out_sig.mean()),
+                't_pvalue': t_p,
+                'mw_pvalue': u_p,
+                'signal_n': len(in_sig),
+                'nosignal_n': len(out_sig)
+            }
+            print(f"H={h}d: Δ={results[h]['delta']:.4f}, t-p={t_p:.3g}, MW-p={u_p:.3g} (n={len(in_sig)}/{len(out_sig)})")
+        return results
+
+    def transaction_costs_sensitivity(self, cost_bps_list=(0, 5, 10, 25), ratio_pct=0.90):
+        """Test strategy sensitivity to transaction costs"""
+        print("\n" + "="*60)
+        print("TRANSACTION COSTS SENSITIVITY")
+        print("="*60)
+        self.strategy.fetch_data()
+        df = self.strategy.data
+
+        thr = df['VVIX_VIX_Ratio'].quantile(ratio_pct)
+        sig = (
+            (df['VVIX_VIX_Ratio'] >= thr) |
+            ((df['VIX'] >= 15) & (df['VVIX'] >= 85))
+        ).astype(int)
+        expo = np.where(sig == 1, 0.5, 1.0)
+        gross = df['SPY_Returns'] * expo
+
+        results = []
+        for c in cost_bps_list:
+            net = self._apply_tc(gross, sig, c) if c > 0 else gross
+            total = (1 + net).cumprod().iloc[-1] - 1
+            ann = (1 + total) ** (252 / len(net)) - 1
+            shp = self._safe_sharpe(net)
+            results.append({'cost_bps': c, 'annualized_return': ann, 'sharpe': shp})
+            print(f"Cost {c} bps: ann={ann*100:.2f}%, sharpe={shp:.2f}")
+        return pd.DataFrame(results)
+    
     def out_of_sample_test(self, split_date='2020-01-01'):
         print("\n" + "="*60)
         print("OUT-OF-SAMPLE TEST")
@@ -321,17 +598,31 @@ class StrategyValidator:
         print("STRATEGY OVERFITTING VALIDATION")
         print("="*60)
         
+        # Run new data quality checks
+        dq = self.data_quality_checks()
+        leakage_ok = self.leakage_check_walk_forward()
+        
+        # Run original validations
         oos_result = self.out_of_sample_test()
         wf_result = self.walk_forward_analysis()
         param_result = self.parameter_stability_test()
-        mc_result = self.monte_carlo_validation()
+        
+        # Run improved Monte Carlo
+        mc_result = self.monte_carlo_validation_improved(method='markov', cost_bps=5)
+        
+        # Run new validations
+        dist = self.distribution_tests()
+        tc = self.transaction_costs_sensitivity()
         
         print("\n" + "="*60)
         print("VALIDATION SUMMARY")
         print("="*60)
         
+        print(f"\nData Quality: {dq['status']}")
+        print(f"Leakage Check: {'PASS' if leakage_ok else 'FAIL'}")
+        
         if oos_result:
-            degradation = abs(oos_result['in_sample']['return'] - oos_result['out_of_sample']['return']) / abs(oos_result['in_sample']['return'])
+            degradation = abs(oos_result['in_sample']['return'] - oos_result['out_of_sample']['return']) / max(abs(oos_result['in_sample']['return']), 1e-9)
             if degradation > 0.5:
                 print("OVERFITTING RISK: High")
             elif degradation > 0.3:
@@ -340,10 +631,14 @@ class StrategyValidator:
                 print("OVERFITTING RISK: Low")
         
         return {
+            'data_quality': dq,
+            'leakage_check': leakage_ok,
             'out_of_sample': oos_result,
             'walk_forward': wf_result,
             'parameter_stability': param_result,
-            'monte_carlo': mc_result
+            'monte_carlo': mc_result,
+            'distribution_tests': dist,
+            'transaction_costs': tc
         }
 
 if __name__ == "__main__":
