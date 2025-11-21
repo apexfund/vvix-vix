@@ -1,0 +1,25 @@
+
+# VVIX/VIX Strategy Analysis Report
+
+## Ratio Statistics
+- Mean: 5.3740
+- Median: 5.5688
+- Standard Deviation: 1.0402
+- Skewness: -0.5136
+- Kurtosis: -0.6810
+
+## Performance Metrics
+- Total Return: 20.55%
+- Annualized Return: 4.62%
+- Volatility: 12.28%
+- Sharpe Ratio: 0.3680
+- Maximum Drawdown: -14.85%
+- Win Rate: 9.69%
+
+## Statistical Tests
+- Test: Decline vs Normal Periods
+- T-statistic: -1.4344
+- P-value: 0.1517
+- Significant: No
+- Effect Size (Cohen's d): -0.1016
+- Mean Difference: -0.11%
