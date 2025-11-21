@@ -201,23 +201,47 @@ class VVIXVIXStrategy:
     
     def strategy_3_adaptive_allocation(self,
                                       ratio_threshold_percentile=75,
-                                      volatility_lookback=20):
+                                      volatility_lookback=20,
+                                      use_corrected_logic=True):
         print("\n" + "="*60)
         print("STRATEGY 3: ADAPTIVE ASSET ALLOCATION")
         print("="*60)
         
-        ratio_25 = self.data['VVIX_VIX_Ratio'].quantile(0.25)
-        ratio_75 = self.data['VVIX_VIX_Ratio'].quantile(0.75)
-        
-        normalized_ratio = (self.data['VVIX_VIX_Ratio'] - ratio_25) / (ratio_75 - ratio_25)
-        normalized_ratio = normalized_ratio.clip(0, 1)
+        if use_corrected_logic:
+            # CORRECTED LOGIC: Lower VVIX/VIX ratio = more stress = reduce exposure
+            # Use percentiles that make sense for the actual distribution
+            ratio_10 = self.data['VVIX_VIX_Ratio'].quantile(0.10)  # Stress threshold
+            ratio_90 = self.data['VVIX_VIX_Ratio'].quantile(0.90)  # Calm threshold
+            
+            print(f"Using CORRECTED logic (lower ratio = more defensive)")
+            print(f"  Ratio at 10th percentile (stress): {ratio_10:.2f}")
+            print(f"  Ratio at 90th percentile (calm): {ratio_90:.2f}")
+            
+            # Normalize: 0 = stress (low ratio), 1 = calm (high ratio)
+            normalized_ratio = (self.data['VVIX_VIX_Ratio'] - ratio_10) / (ratio_90 - ratio_10)
+            normalized_ratio = normalized_ratio.clip(0, 1)
+            
+            # Exposure: high when calm (ratio=1), low when stressed (ratio=0)
+            # Formula: 0.5 + (normalized_ratio * 0.5) gives range [50%, 100%]
+            equity_exposure = 0.5 + (normalized_ratio * 0.5)
+            
+        else:
+            # ORIGINAL LOGIC (kept for comparison)
+            ratio_25 = self.data['VVIX_VIX_Ratio'].quantile(0.25)
+            ratio_75 = self.data['VVIX_VIX_Ratio'].quantile(0.75)
+            
+            print(f"Using ORIGINAL logic")
+            
+            normalized_ratio = (self.data['VVIX_VIX_Ratio'] - ratio_25) / (ratio_75 - ratio_25)
+            normalized_ratio = normalized_ratio.clip(0, 1)
+            
+            equity_exposure = 1.0 - (normalized_ratio * 0.7)
         
         signals = pd.DataFrame(index=self.data.index)
         signals['SPY_Returns'] = self.data['SPY_Returns']
         signals['Ratio'] = self.data['VVIX_VIX_Ratio']
         signals['Normalized_Ratio'] = normalized_ratio
-        
-        signals['Equity_Exposure'] = 1.0 - (normalized_ratio * 0.7)
+        signals['Equity_Exposure'] = equity_exposure
         
         signals['Strategy_Returns'] = signals['SPY_Returns'] * signals['Equity_Exposure']
         
@@ -241,6 +265,14 @@ class VVIXVIXStrategy:
         print(f"  Min equity exposure: {signals['Equity_Exposure'].min():.1%}")
         print(f"  Max equity exposure: {signals['Equity_Exposure'].max():.1%}")
         
+        # Diagnostic info
+        high_vix = self.data['VIX'] > 25
+        low_vix = self.data['VIX'] < 15
+        if high_vix.sum() > 0:
+            print(f"  Avg exposure during high VIX (>25): {signals.loc[high_vix, 'Equity_Exposure'].mean():.1%}")
+        if low_vix.sum() > 0:
+            print(f"  Avg exposure during low VIX (<15): {signals.loc[low_vix, 'Equity_Exposure'].mean():.1%}")
+        
         print(f"\nPerformance Metrics:")
         print(f"  SPY Total Return: {spy_total_return*100:.2f}%")
         print(f"  Strategy Total Return: {strategy_total_return*100:.2f}%")
@@ -259,6 +291,101 @@ class VVIXVIXStrategy:
                 'sharpe_ratio': strategy_sharpe,
                 'max_drawdown': strategy_max_dd,
                 'avg_exposure': signals['Equity_Exposure'].mean()
+            }
+        }
+        
+        return signals
+    
+    def strategy_3_improved(self, base_exposure_min=0.70, extreme_threshold=35):
+        """
+        IMPROVED Strategy 3: Higher base exposure with extreme event protection
+        
+        Args:
+            base_exposure_min: Minimum exposure level (default 70%)
+            extreme_threshold: VIX level for extreme protection (default 35)
+        """
+        print("\n" + "="*60)
+        print("STRATEGY 3 IMPROVED: ADAPTIVE ALLOCATION")
+        print("="*60)
+        
+        ratio_10 = self.data['VVIX_VIX_Ratio'].quantile(0.10)
+        ratio_90 = self.data['VVIX_VIX_Ratio'].quantile(0.90)
+        
+        print(f"Using IMPROVED logic with higher base exposure")
+        print(f"  Base exposure range: {base_exposure_min*100:.0f}% to 100%")
+        print(f"  Ratio at 10th percentile (stress): {ratio_10:.2f}")
+        print(f"  Ratio at 90th percentile (calm): {ratio_90:.2f}")
+        print(f"  Extreme VIX threshold: {extreme_threshold}")
+        
+        # Normalize: 0 = stress, 1 = calm
+        normalized_ratio = (self.data['VVIX_VIX_Ratio'] - ratio_10) / (ratio_90 - ratio_10)
+        normalized_ratio = normalized_ratio.clip(0, 1)
+        
+        # Higher base exposure: e.g., 70-100% instead of 50-100%
+        exposure_range = 1.0 - base_exposure_min
+        equity_exposure = base_exposure_min + (normalized_ratio * exposure_range)
+        
+        # Extreme event override: if VIX is extreme AND ratio is very low
+        extreme_stress = (self.data['VIX'] > extreme_threshold) & (self.data['VVIX_VIX_Ratio'] < ratio_10)
+        equity_exposure = np.where(extreme_stress, 0.5, equity_exposure)
+        
+        signals = pd.DataFrame(index=self.data.index)
+        signals['SPY_Returns'] = self.data['SPY_Returns']
+        signals['Ratio'] = self.data['VVIX_VIX_Ratio']
+        signals['Normalized_Ratio'] = normalized_ratio
+        signals['Equity_Exposure'] = equity_exposure
+        signals['Extreme_Signal'] = extreme_stress.astype(int)
+        
+        signals['Strategy_Returns'] = signals['SPY_Returns'] * signals['Equity_Exposure']
+        
+        signals['SPY_Cumulative'] = (1 + signals['SPY_Returns']).cumprod()
+        signals['Strategy_Cumulative'] = (1 + signals['Strategy_Returns']).cumprod()
+        
+        spy_total_return = signals['SPY_Cumulative'].iloc[-1] - 1
+        strategy_total_return = signals['Strategy_Cumulative'].iloc[-1] - 1
+        
+        spy_annualized = (1 + spy_total_return) ** (252 / len(signals)) - 1
+        strategy_annualized = (1 + strategy_total_return) ** (252 / len(signals)) - 1
+        
+        spy_sharpe = signals['SPY_Returns'].mean() / signals['SPY_Returns'].std() * np.sqrt(252)
+        strategy_sharpe = signals['Strategy_Returns'].mean() / signals['Strategy_Returns'].std() * np.sqrt(252)
+        
+        spy_max_dd = self.calculate_max_drawdown(signals['SPY_Cumulative'])
+        strategy_max_dd = self.calculate_max_drawdown(signals['Strategy_Cumulative'])
+        
+        print(f"\nExposure Statistics:")
+        print(f"  Average equity exposure: {signals['Equity_Exposure'].mean():.1%}")
+        print(f"  Min equity exposure: {signals['Equity_Exposure'].min():.1%}")
+        print(f"  Max equity exposure: {signals['Equity_Exposure'].max():.1%}")
+        print(f"  Extreme events triggered: {signals['Extreme_Signal'].sum()} days")
+        
+        # Diagnostic info
+        high_vix = self.data['VIX'] > 25
+        low_vix = self.data['VIX'] < 15
+        if high_vix.sum() > 0:
+            print(f"  Avg exposure during high VIX (>25): {signals.loc[high_vix, 'Equity_Exposure'].mean():.1%}")
+        if low_vix.sum() > 0:
+            print(f"  Avg exposure during low VIX (<15): {signals.loc[low_vix, 'Equity_Exposure'].mean():.1%}")
+        
+        print(f"\nPerformance Metrics:")
+        print(f"  SPY Total Return: {spy_total_return*100:.2f}%")
+        print(f"  Strategy Total Return: {strategy_total_return*100:.2f}%")
+        print(f"  SPY Annualized Return: {spy_annualized*100:.2f}%")
+        print(f"  Strategy Annualized Return: {strategy_annualized*100:.2f}%")
+        print(f"  SPY Sharpe Ratio: {spy_sharpe:.2f}")
+        print(f"  Strategy Sharpe Ratio: {strategy_sharpe:.2f}")
+        print(f"  SPY Max Drawdown: {spy_max_dd*100:.2f}%")
+        print(f"  Strategy Max Drawdown: {strategy_max_dd*100:.2f}%")
+        
+        self.strategy_results['Adaptive_Allocation_Improved'] = {
+            'signals': signals,
+            'metrics': {
+                'total_return': strategy_total_return,
+                'annualized_return': strategy_annualized,
+                'sharpe_ratio': strategy_sharpe,
+                'max_drawdown': strategy_max_dd,
+                'avg_exposure': signals['Equity_Exposure'].mean(),
+                'extreme_events': signals['Extreme_Signal'].sum()
             }
         }
         
